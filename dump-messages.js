@@ -38,13 +38,10 @@
   function decodeProtobufWithState(spec, s) {
     const result = {};
     while (s.cursor < s.length) {
-      const header = s.data.getUint8(s.cursor); s.cursor += 1;
+      const header = decodeVarint(s);
       const field = header >> 3;
       const wireType = header & 0x7;
-      const fieldSpec = spec[field];
-      if (fieldSpec === undefined) {
-        throw `non-specced field ${field}`;
-      }
+      const fieldSpec = spec[field] ?? { type: 'bytes', name: `unknown_${field}` };
       let fieldValue = null;
       if (wireType == 0) { // varint (int32, int64, uint32, uint64, sint32, sint64, bool, enum)
         fieldValue = decodeVarint(s);
@@ -62,6 +59,9 @@
         const length = decodeVarint(s);
         if (fieldSpec.type === "string") {
           fieldValue = utf8Decoder.decode(new DataView(s.data.buffer, s.data.byteOffset + s.cursor, length));
+          s.cursor += length;
+        } else if (fieldSpec.type === "bytes") {
+          fieldValue = `(${length} bytes)`;
           s.cursor += length;
         } else if (typeof fieldSpec.type === "object") {
           fieldValue = decodeProtobufWithState(fieldSpec.type, {
