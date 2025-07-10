@@ -30,38 +30,28 @@
   }
 
   // protobuf message decoder. See `decodeWhatsAppProtobuf` message for example on
-  // the spec format. We currently only bother with wire types encountered when
-  // decoding whatsapp messages.
+  // the spec format. We currently only bother with strings, since I only encountered
+  // those so far.
   //
   // rule: we increase cursor _as soon as the data is consumed_.
   // cursor should always be at the byte we need to read next.
   function decodeProtobufWithState(spec, s) {
     const result = {};
     while (s.cursor < s.length) {
-      const header = s.data.getUint8(s.cursor); s.cursor += 1;
+      const header = decodeVarint(s);
       const field = header >> 3;
       const wireType = header & 0x7;
-      const fieldSpec = spec[field];
-      if (fieldSpec === undefined) {
-        throw `non-specced field ${field}`;
-      }
+      const fieldSpec = spec[field] ?? { type: 'string', name: `unknown_${field}` };
       let fieldValue = null;
-      if (wireType == 0) { // varint (int32, int64, uint32, uint64, sint32, sint64, bool, enum)
-        fieldValue = decodeVarint(s);
-      } else if (wireType === 1) { // fixed64, sfixed64, double
-        if (fieldSpec.type === "double") {
-          fieldValue = s.data.getFloat64(s.cursor, true); s.cursor += 8;
-        } else if (fieldSpec.type === "int64") {
-          fieldValue = s.data.getBigInt64(s.cursor, true); s.cursor += 8;
-        } else if (fieldSpec.type === "uint64") {
-          fieldValue = s.data.getBigUint64(s.cursor, true); s.cursor += 8;
-        } else {
-          throw `bad type for 64-bit data: ${fieldSpec.name}, ${fieldSpec.type}`;
-        }
-      } else if (wireType === 2) { // length-delimited
+      if (wireType === 2) { // length-delimited
         const length = decodeVarint(s);
         if (fieldSpec.type === "string") {
-          fieldValue = utf8Decoder.decode(new DataView(s.data.buffer, s.data.byteOffset + s.cursor, length));
+          const data = new DataView(s.data.buffer, s.data.byteOffset + s.cursor, length);
+          try {
+            fieldValue = utf8Decoder.decode(data);
+          } catch (error) {
+            fieldValue = Array.from({ length }, (_, i) => data.getUint8(i).toString(16).padStart(2, '0')).join(' ');
+          }
           s.cursor += length;
         } else if (typeof fieldSpec.type === "object") {
           fieldValue = decodeProtobufWithState(fieldSpec.type, {
@@ -71,18 +61,8 @@
           });
           s.cursor += length;
         } else {
-          throw `bad field type for length-delimited data: ${fieldSpec.name}, ${JSON.stringify(fieldSpec.type)}`;
+          throw `bad field type for length-delimited data ${JSON.stringify(fieldSpec.type)}`;
         }
-      } else if (wireType === 5) { // fixed32, sfixed32, float
-        if (fieldSpec.type === "float") {
-          fieldValue = s.data.getFloat32(s.cursor, true); s.cursor += 4;
-        } else if (fieldSpec.type === "int32") {
-          fieldValue = s.data.getInt32(s.cursor, true); s.cursor += 4;
-        } else if (fieldSpec.type === "uint32") {
-          fieldValue = s.data.getInt32(s.cursor, true); s.cursor += 4;
-        } else {
-          throw `bad type for 32-bit data: ${fieldSpec.name}, ${fieldSpec.type}`;
-        }        
       } else {
         throw `unimplemented wire type ${wireType}`;
       }
@@ -107,8 +87,9 @@
     const msgSpec = {
       1: { name: "body", type: "string" },
       3: { name: "caption", type: "string" },
+      // 4: { name: 'clientUrl', type: 'string' },
+      4: { name: "loc", type: "string" },
       5: { name: "lng", type: "double" },
-      6: { name: "isLive", type: "bool" },
       7: { name: "lat", type: "double" },
       8: { name: "paymentAmount1000", type: "int32" },
       9: { name: "paymentNoteMsgBody", type: "string" },
@@ -117,15 +98,6 @@
       12: { name: "title", type: "string" },
       13: { name: "description", type: "string" },
       14: { name: "futureproofBuffer", type: "bytes" },
-      15: { name: "clientUrl", type: "string" },
-      16: { name: "loc", type: "string" },
-      17: { name: "pollName", type: "string" },
-      // 18: { name: "pollOptions"}, not implemented, repeated messages
-      20: { name: "pollSelectableOptionsCount", type: "uint32" },
-      21: { name: "messageSecret", type: "bytes" },
-      22: { name: "senderTimestampMs", type: "int64" },
-      23: { name: "pollUpdateParentKey", type: "string" },
-      // 24: { name: "encPollVote" }, not implemented, repeated messages
     };
     const fullMsgSpec = {
       1: { name: "currentMsg", type: msgSpec },
@@ -302,51 +274,38 @@
     return cleartext;
   }
 
-  // See <https://stackoverflow.com/a/9458996/524111>
-  function arrayBufferToBase64(buffer) {
-    let binary = "";
-    const bytes = new Uint8Array( buffer );
-    const len = bytes.byteLength;
-    for (let i = 0; i < len; i++) {
-      binary += String.fromCharCode( bytes[ i ] );
-    }
-    return window.btoa(binary);
-  }
-
   // decrypt and decode a single message
   async function decryptMessage(config, mediaCache, { algorithm, key }, stats, messages, mediaBlobs, encodedMessage) {
-    if (encodedMessage.msgRowOpaqueData) {
+    if (encodedMessage.type === "chat") {
       const msgBytes = await crypto.subtle.decrypt(
         { ...algorithm, iv: encodedMessage.msgRowOpaqueData.iv },
         key,
         encodedMessage.msgRowOpaqueData._data,
       );  
-      delete encodedMessage.msgRowOpaqueData;  
-      encodedMessage.msgRowData = arrayBufferToBase64(msgBytes);
-      if (encodedMessage.type === "chat") {
-        let decoded = null;
-        try {
-          decoded = decodeWhatsAppProtobufMessage(msgBytes);
-        } catch (e) {
-          console.error(`could not decode message ${encodedMessage.id}`, e);
-          throw e;
-        }
-        encodedMessage.msgRow = decoded;
-      } else if (config.dumpMedia && isMediaMessage(encodedMessage.type)) {
-        let mediaBytes = null;
-        try {
-          mediaBytes = await downloadAndDecryptMedia(config, mediaCache, stats, encodedMessage);
-        } catch (e) {
-          console.error(`could not download and decrypt media for message ${encodedMessage.id}`, e);
-          throw e;
-        }
-        if (mediaBytes !== null) {
-          mediaBlobs[encodedMessage.filehash] = mediaBytes;
-        }
-      } else {
-        stats.unknownType.add(encodedMessage.id);
+      let decoded = null;
+      try {
+        decoded = decodeWhatsAppProtobufMessage(msgBytes);
+      } catch (e) {
+        console.error(`could not decode message ${encodedMessage.id}`, e);
+        throw e;
       }
+      encodedMessage.msgRow = decoded;
+    } else if (config.dumpMedia && isMediaMessage(encodedMessage.type)) {
+      let mediaBytes = null;
+      try {
+        mediaBytes = await downloadAndDecryptMedia(config, mediaCache, stats, encodedMessage);
+      } catch (e) {
+        console.error(`could not download and decrypt media for message ${encodedMessage.id}`, e);
+        throw e;
+      }
+      if (mediaBytes !== null) {
+        delete encodedMessage.msgRowOpaqueData;
+        mediaBlobs[encodedMessage.filehash] = mediaBytes;
+      }
+    } else {
+      stats.unknownType.add(encodedMessage.id);
     }
+    delete encodedMessage.msgRowOpaqueData;
     messages.push(encodedMessage);  
   }
 
@@ -396,36 +355,30 @@
     const objectStore = db.transaction("message").objectStore("message");
     objectStore.openCursor().onsuccess = (event) => {
       const cursor = event.target.result;
-      const message = event.target.result.value;
-      if (message.msgRowOpaqueData && message.type === "chat") {
-        const testData = message.msgRowOpaqueData;
-        const originalDecrypt = window.crypto.subtle.decrypt;
-        window.crypto.subtle.decrypt = function (algorithm, key, data) {
-          // try to decode
-          if (window.whatsappDecryptArgs === null) {
-            // eslint-disable-next-line @typescript-eslint/no-this-alias
-            const that = this;
-            (async () => {
-              try {
-                const msgBytes = await originalDecrypt.call(that, { ...algorithm, iv: testData.iv }, key, testData._data);
-                decodeWhatsAppProtobufMessage(msgBytes);
-                // We've made it, store the key
-                if (window.whatsappDecryptArgs !== null) { return; } // somebody might have gotten there first, it's async
-                window.crypto.subtle.decrypt = originalDecrypt;
-                window.whatsappDecryptArgs = { algorithm: { ...algorithm }, key };
-                delete window.whatsappDecryptArgs.algorithm.iv;
-                console.log("decrypt args found", window.whatsappDecryptArgs);
-                withDecryptArgs(window.whatsappDecryptArgs);
-              } catch (e) {
-                console.debug("could not decode test data", e);
-              }
-            })();
-          }
-          return originalDecrypt.call(this, algorithm, key, data);
-        };  
-      } else {
-        cursor.continue();
-      }
+      const testData = cursor.value.msgRowOpaqueData;
+      const originalDecrypt = window.crypto.subtle.decrypt;
+      window.crypto.subtle.decrypt = function (algorithm, key, data) {
+        // try to decode
+        if (window.whatsappDecryptArgs === null) {
+          // eslint-disable-next-line @typescript-eslint/no-this-alias
+          const that = this;
+          (async () => {
+            try {
+              await originalDecrypt.call(that, { ...algorithm, iv: testData.iv }, key, testData._data);
+              // We've made it, store the key
+              if (window.whatsappDecryptArgs !== null) { return; } // somebody might have gotten there first, it's async
+              window.crypto.subtle.decrypt = originalDecrypt;
+              window.whatsappDecryptArgs = { algorithm: { ...algorithm }, key };
+              delete window.whatsappDecryptArgs.algorithm.iv;
+              console.log("decrypt args found", window.whatsappDecryptArgs);
+              withDecryptArgs(window.whatsappDecryptArgs);
+            } catch (e) {
+              console.debug("could not decode test data", e);
+            }
+          })();
+        }
+        return originalDecrypt.call(this, algorithm, key, data);
+      };
     };
   }
 
@@ -470,7 +423,7 @@
 
   dumpWhatsApp({
     // Save media on top of text messages
-    dumpMedia: false,
+    dumpMedia: true,
     // Dump only media which is already cached locally. Only relevant if `dumpMedia` is
     // true.
     dumpOnlyCachedMedia: true,
